@@ -10,7 +10,27 @@ import (
 	"unsafe"
 )
 
+const CBAUD = 0010017
+
 func openPort(name string, c *Config) (rwc io.ReadWriteCloser, err error) {
+	f, err := os.OpenFile(name, syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_NONBLOCK, 0666)
+	if err != nil {
+		return nil, err
+	}
+
+	fd := f.Fd()
+	t := syscall.Termios{}
+	if _, _, errno := syscall.Syscall6(
+		syscall.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(syscall.TCGETS),
+		uintptr(unsafe.Pointer(&t)),
+		0,
+		0,
+		0,
+	); errno != 0 {
+		return nil, errno
+	}
 
 	var rate uint32
 	switch c.Baud {
@@ -33,51 +53,54 @@ func openPort(name string, c *Config) (rwc io.ReadWriteCloser, err error) {
 	if rate == 0 {
 		return
 	}
+	t.Cflag = (t.Cflag &^ CBAUD) | rate
+	t.Ispeed = rate
+	t.Ospeed = rate
 
-	var stop uint32
 	switch c.StopBits {
 	case StopBits1:
-		stop = 0
+		t.Cflag &^= syscall.CSTOPB
 	case StopBits2:
-		stop = syscall.CSTOPB
+		t.Cflag |= syscall.CSTOPB
 	default:
 		panic(c.StopBits)
 	}
 
-	var size uint32
+	t.Cflag &^= syscall.CSIZE
 	switch c.Size {
 	case Byte5:
-		size = syscall.CS5
+		t.Cflag |= syscall.CS5
 	case Byte6:
-		size = syscall.CS6
+		t.Cflag |= syscall.CS6
 	case Byte7:
-		size = syscall.CS7
+		t.Cflag |= syscall.CS7
 	case Byte8:
-		size = syscall.CS8
+		t.Cflag |= syscall.CS8
 	default:
 		panic(c.Size)
 	}
 
-	if size == 0 {
-		return
-	}
-
-	var parity uint32
 	switch c.Parity {
 	case ParityNone:
-		parity = 0
+		t.Cflag &^= syscall.PARENB
 	case ParityEven:
-		parity = 2
+		t.Cflag |= syscall.PARENB
 	case ParityOdd:
-		parity = 1
+		t.Cflag |= syscall.PARENB
+		t.Cflag |= syscall.PARODD
 	default:
 		panic(c.Parity)
 	}
 
-	f, err := os.OpenFile(name, syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_NONBLOCK, 0666)
-	if err != nil {
-		return nil, err
+	if c.CRLFTranslate {
+		t.Iflag |= syscall.ICRNL
+	} else {
+		t.Iflag &^= syscall.ICRNL
 	}
+
+	// Select raw mode
+	t.Lflag &^= syscall.ICANON | syscall.ECHO | syscall.ECHOE | syscall.ISIG
+	t.Oflag &^= syscall.OPOST
 
 	defer func() {
 		if err != nil && f != nil {
@@ -85,15 +108,8 @@ func openPort(name string, c *Config) (rwc io.ReadWriteCloser, err error) {
 		}
 	}()
 
-	fd := f.Fd()
-	t := syscall.Termios{
-		Iflag:  syscall.IGNPAR,
-		Cflag:  stop | size | parity | syscall.CREAD | syscall.CLOCAL | rate,
-		Cc:     [32]uint8{syscall.VMIN: 1},
-		Ispeed: rate,
-		Ospeed: rate,
-	}
-
+	t.Cc[syscall.VMIN] = 1
+	t.Cc[syscall.VTIME] = 0
 	if _, _, errno := syscall.Syscall6(
 		syscall.SYS_IOCTL,
 		uintptr(fd),
